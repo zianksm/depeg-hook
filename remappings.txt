@@ -1,1 +1,4 @@
 forge-std/=lib/forge-std/src/
+@chainlink/local/=lib/chainlink-local/
+@uniswap/v4-core/=lib/v4-periphery/lib/v4-core/
+@uniswap/v4-periphery/=lib/v4-periphery
