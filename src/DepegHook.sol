@@ -14,12 +14,20 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import "v4-periphery/lib/v4-core/src/types/BeforeSwapDelta.sol";
 import {HookMath} from "./lib/Math.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
+import {SqrtPriceMath} from "v4-core/libraries/SqrtPriceMath.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {IHooks} from "v4-periphery/lib/v4-core/src/interfaces/IHooks.sol";
+import "v4-periphery/lib/v4-core/src/types/BalanceDelta.sol";
+import "openzeppelin-contracts/contracts/interfaces/IERC20.sol";
+import "forge-std/console.sol";
 
 // TODO : Adjust ticks liquidity range
 contract DepegHook is BaseHook, ERC20 {
     using PairLibrary for Pair;
     using CurrencySettler for Currency;
 
+    // thrown if addLiquidity is called while depeg protection is enabled
+    // and trying to add liquidity directly to the pool.
     error HookAddLiquidityDisabled();
 
     enum Action {
@@ -43,6 +51,16 @@ contract DepegHook is BaseHook, ERC20 {
     // if true then depeg protection is enabled(all swap will be halted)
     bool public DEPEG_FLAG;
 
+    // simplicity sake, will deposit liquidity from this range
+    // ~0.8999692073
+    int24 public constant DEFAULT_LOWER_TICKS = -1054;
+    // ~1.02020032
+    int24 public constant DEFAULT_UPPER_TICKS = 200;
+
+    // 0.1%
+    uint24 public constant DEFAULT_FEE = 1000;
+    int24 public constant DEFAULT_TICK_SPACING = 1;
+
     // dsId -> DepegSwapsTokenInfo
     mapping(uint256 => DepegSwapsTokenInfo) public depegSwapsTokenInfo;
 
@@ -51,6 +69,10 @@ contract DepegHook is BaseHook, ERC20 {
 
     Id public immutable CURRENCY_ID;
 
+    Currency public immutable PEGGED_ASSET;
+    Currency public immutable REDEMPTION_ASSET;
+
+    // 1%
     uint256 public constant TEMP_PROTECTION_RATIO = 1 ether;
 
     function psm() internal view returns (IPSMcore) {
@@ -59,6 +81,16 @@ contract DepegHook is BaseHook, ERC20 {
 
     function moduleCore() internal view returns (ICommon) {
         return ICommon(cork);
+    }
+
+    function poolKey(Currency currency0, Currency currency1) internal view returns (PoolKey memory) {
+        return PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: DEFAULT_FEE,
+            tickSpacing: DEFAULT_TICK_SPACING,
+            hooks: IHooks(address(this))
+        });
     }
 
     // 1%
@@ -70,6 +102,9 @@ contract DepegHook is BaseHook, ERC20 {
         Currency redemptionAsset,
         Currency peggedAsset
     ) BaseHook(manager) ERC20("Depeg protection", "DPG") {
+        PEGGED_ASSET = peggedAsset;
+        REDEMPTION_ASSET = redemptionAsset;
+
         priceFeed = _priceFeed;
         cork = _cork;
         CURRENCY_ID = PairLibrary.initalize(Currency.unwrap(peggedAsset), Currency.unwrap(redemptionAsset)).toId();
@@ -112,10 +147,14 @@ contract DepegHook is BaseHook, ERC20 {
         revert HookAddLiquidityDisabled();
     }
 
-    // insecure, won't handle actual ratio
-    function addLiquidity(PoolKey calldata key, uint256 amountEach) external {
+    // insecure, won't handle actual ratio, just for poc
+    function addLiquidity(uint256 amountEach) external {
+        if (DEPEG_FLAG) {
+            revert HookAddLiquidityDisabled();
+        }
+
         poolManager.unlock(
-            abi.encode(CallbackData(amountEach, key.currency0, key.currency1, msg.sender, Action.ADD_LIQUIDITY))
+            abi.encode(CallbackData(amountEach, REDEMPTION_ASSET, PEGGED_ASSET, msg.sender, Action.ADD_LIQUIDITY))
         );
     }
 
@@ -136,6 +175,8 @@ contract DepegHook is BaseHook, ERC20 {
         callbackData.currency1.take(poolManager, address(this), cut, false);
 
         // deposit the cut amount to PSM
+        // IERC20(Currency.unwrap(REDEMPTION_ASSET)).transferFrom(callbackData.sender, address(this), cut);
+        IERC20(Currency.unwrap(REDEMPTION_ASSET)).approve(cork, cut);
         psm().depositPsm(CURRENCY_ID, cut);
 
         // store infos
@@ -148,6 +189,16 @@ contract DepegHook is BaseHook, ERC20 {
         // because if we mint equal to the amount this will complicate stuff in case user wants to remove liquidity
         // not ideal, just for proof of concept
         _mint(callbackData.sender, callbackData.amountEach - cut);
+    }
+
+    function upkeep() external {
+        (, uint256 answer,,,) = priceFeed.latestRoundData();
+
+        if (answer < 0.9 ether) {
+            DEPEG_FLAG = true;
+        } else {
+            DEPEG_FLAG = false;
+        }
     }
 
     function _unlockCallback(bytes calldata data) internal override returns (bytes memory) {

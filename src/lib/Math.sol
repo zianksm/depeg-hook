@@ -1,4 +1,4 @@
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.24;
 
 library HookMath {
     function calculatePrecentage(uint256 x, uint256 percent) internal pure returns (uint256 result) {
